@@ -1,9 +1,7 @@
 # TSF1.0 Design Document
 
 
-## Overview
-
-### Summary
+## Summary
 
 This document provides an overview of the proposed changes to Chromium to support TSF1.0, enabling IMEs to update content on a webpage through the Windows Input Service. TSF1.0 also provides text intelligence features such as on-screen keyboard input suggestions, shape-writing in on-screen keyboard, customized on-screen keyboard UI for different types of edit control that are not available in IMM32. A partial implementation of TSF1.0, disabled by default, exists in Chromium today.  This document describes a way to implement full support for TSF1.0 in Chromium, building on the existing implementation.
 
@@ -18,11 +16,32 @@ Windows Desktop.
 The changes impact content.dll and ui_base_ime.dll.
 
 
-## Architecture Overview
+## Overview
+
+Windows Input Service facilitates communication between input methods (handwriting recognition, speech recognition, shape-writing, etc), and editing applications that want text input (code editors, rich text editing applications like Microsoft Word, or web browsers). Each editing application has a model for representing the content it edits, and to avoid the need for each input method to code against N different editor document models, Windows Input Service defines an intermediate language to facilitate communication between the editing applications and the input methods: a shared plain-text buffer of content.
+
+The shared buffer is updated cooperatively with the help of Windows Input Service. When an input method delivers input to an editing application, it does so by requesting that Windows Input Service update the shared buffer, and Windows Input Service can in response notify the editing app how the buffer is being modified so that the editing application can update its document model. Selection state, layout state highlighting state and composition state are used to describe the state in the buffer. Selection state reflects current selection in the document model. When input method requests a selection range, Windows Input Service gets up-to-date selection range from the document model and reports the selection range to the input method. Highlighting of text in the buffer can also be requested by input method so it can indicate what text is being composed in response to phonetic input. When input method requests a highlight over the range to show the candidate window, Windows Input Service queries for the bounding rectangle coordinates of focused editing control and editing application is responsible to draw highlight on the range requested by Windows Input Service. After the user finishes composing and commits final composition text, Windows Input Service updates the shared buffer with committed text and changes composition state to notify editing application that composition has been completed. Editing app is responsible for clearing highlighted range in the document model and replace the highlighted text with committed text.
+
+### Constraint and Principle
+
+TSF1 requires a synchronous response to queries about the state of the shared buffer, yet the input thread of the browser process must remain responsive. To acheive both requirements, no blocking cross-process calls or waiting for script to yield so the state of the DOM can be read will be allowed; instead all queries must be fulfilled from cached state maintained in the browser process that mirrors (with some imperceptible delay) the contents of the DOM in the renderer process.
+
+Since both input methods and editing applications are trying to update the same editable content, conflicts can occur. To resolve conflicts, the order of operations as seen by the DOM will be considered authoritative.
+
+After resolving the conflict, the shared buffer may not reflect the input delivered by Windows Input Service, an algorithm must be used to determine and notify the input method about the additional change made to the shared buffer.
+
+### Key assumption
+
+The view of the editable content provided to Windows Input Service should be aligned with what the user sees on the screen. Transient state of the DOM that the user cannot see is irrelevant to the editing process and the view provided of the editable content to Windows Text Service.
+
+We are free to reuse TSF objects that describe the content of an editable region of an editing app as there is no known data cached using the identity of these objects, i.e. all that is necessary to facilitate a great editing experience can be computed from the contents of the DOM and populated into an appropriate TSF object as focus shifts from one editable element to another.
+
+
+## Architecture
 
 TSF1.0 support involves three key components: Windows Input Service, a TSF1.0 component in the browser process, and TextInputClient representing edit control in a renderer process. The TSF1.0 component communicates with renderer processes via the TextInputClient interface, and uses several COM interfaces to communicate with the Windows Input Service. When the browser process launches for the first time, TSFTextStore, which implements ITextStoreACP, ITfContextOwnerCompositionSink, ITfTextEditSink and ITfKeyTraceEventSink interfaces provided by Windows Input Service, is created by TSFBridgeImpl, which is the manager of TSFTextStore, for each input type. Once TSFTextStore is successfully registered with Windows Input Service, it is ready to receive function calls to modify content in edit control. Windows Input Service uses TSFTextStore to query for editing context in Blink in order to do operations such as insert text, change selection, update composition, etc. 
 
-When the browser process launches for the first time, it calls `BrowserMainRunnerImpl::Initialize` to initialize the main thread and other things like the main message loop, OLE etc. In this function, `ui::InitializeInputMethod` is called which is a static method that initializes the TSFBridgeImpl (a TLS implementation of TSFBridge). TSFBridgeImpl is created for a specific window handle and lives in the thread environment block of the UI thread. `TSFBridgeImpl::Initialize` method CoCreates the thread manager instance and then initializes ITfContexts for each TextInputType through `TSFBridgeImpl::InitializeDocumentMapInternal` API. The API also creates a document-to-TSFTextStore map based on TextInputType of the TextInputClient (implemented by RenderWidgetHostViewAura). It creates a TSFTextStore for each TextInputType, which can have following values:
+When the browser process launches for the first time, it calls `BrowserMainRunnerImpl::Initialize` to initialize the main thread and other things like the main message loop, OLE etc. In this function, `ui::InitializeInputMethod` is called which is a static method that initializes the TSFBridgeImpl (a TLS implementation of TSFBridge). TSFBridgeImpl is created for a specific window handle and lives in the thread environment block of the UI thread. `TSFBridgeImpl::Initialize` method CoCreates the thread manager instance which is unique for current HWND. Thread manager then initializes ITfContexts for each TextInputType through `TSFBridgeImpl::InitializeDocumentMapInternal` API. The API also creates a 1-to-1 relationship of ITfDocumentMgr-to-TSFTextStore map based on TextInputType of the TextInputClient (implemented by RenderWidgetHostViewAura). It creates a TSFTextStore for each TextInputType, which can have following values:
 
 * TEXT_INPUT_TYPE_NONE
 * TEXT_INPUT_TYPE_TEXT
@@ -33,7 +52,7 @@ When the browser process launches for the first time, it calls `BrowserMainRunne
 * TEXT_INPUT_TYPE_TELEPHONE
 * TEXT_INPUT_TYPE_URL 
 
-Once TSFTextStore is successfully registered with the Windows Input Service, it is ready to receive function calls to modify content in edit control. Right after the edit control is in focus, TSFTextStore will hold a reference to the view (RenderWidgetHostViewAura), which implements TextInputClient interface. Since TSFTextStore doesn't cache any editing context of focused edit control, Windows Input Service gets empty text and selection of (0,0) after querying for the editing context from TSFTextStore. TSFTextStore uses TextInputClient interface to do operations (delete a range, insert text, commit composition, etc) in renderer process. As soon as the mojo message reaches renderer process, InputMethodController is the final object to do the work.
+We have created thread manager instance, ITfDocumentMgr assotiated with TSFTextStore for each TextInputType. Once TSFTextStore is successfully registered with the Windows Input Service, it is ready to receive function calls to modify content in edit control. Right after the edit control is in focus, TSFTextStore will hold a reference to the view (RenderWidgetHostViewAura), which implements TextInputClient interface. Since TSFTextStore doesn't cache any editing context of focused edit control, Windows Input Service gets empty text and selection of (0,0) after querying for the editing context from TSFTextStore. TSFTextStore uses TextInputClient interface to do operations (delete a range, insert text, commit composition, etc) in renderer process. As soon as the mojo message reaches renderer process, InputMethodController is the final object to do the work.
 
 Here is a graphical view of the architecture between each components:
 
@@ -82,9 +101,11 @@ First race condition happens within TSFTextStore. When we run diffing algorithm 
 A second race condition happens due to the asynchronous mojo communication between browser process and renderer process. There may be a case where the current edit session has ended but the TextInputState hasn't been updated yet. In this case we shouldn't use stale TextInputState struct to run diffing algorithm. We should wait and run the algorithm until the TextInputState is updated. The solution is also illustrated in the graphical explainer above.
 
 
-### Trade-offs with proposed design
+### Considerations for TSFTextStore Reuse
 
-For TSF1.0 Support, it would be ideal if we can create TSFTextStore for each edit control that is editable and provide full editing context to Windows Input Service. However, browser process has no knowledge about DOM element concept and TSFTextStore lives inside the browser process. TSFTextStore cannot be created for each edit control in current Chromium architecture. Therefore, TSFTextStore objects are created based on the predefined INPUT types and each input type shares the TSFTextStore object.
+For TSF1.0 Support, it would be ideal if we can create TSFTextStore for each edit control that is editable and provide full editing context to Windows Input Service. Text intelligence features are relying on the context in the focused edit control. TSFTextStore is used to report the context to Windows Input Service. If we have a 1-to-1 relationship between TSFTextStore and editable elements, then the context in TSFTextStore is preserved when focus changes to another editable element.
+
+However, browser process has no knowledge about DOM element concept and TSFTextStore lives inside the browser process. TSFTextStore cannot be created for each edit control in current Chromium architecture. Therefore, TSFTextStore objects are created based on the predefined INPUT types and each input type shares the TSFTextStore object.
 
 In order to achieve 1 to 1 relationship between TSFTextStore and edit control, we would need to modify existing Chromium architecture to expose edit control to browser process. Such a change will impact all platforms. By following the existing architecture, we re-use TSFTextStore when focus switches from first edit control to second edit control with same predefined input type. the cached context in TSFTextStore is changed to the context of the second edit control. When the focus switches back to the first edit control, the context cached in TSFTextStore is changed back to the context of the first edit control.
 
